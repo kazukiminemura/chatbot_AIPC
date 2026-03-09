@@ -1,19 +1,16 @@
-# Chatbot with MiniCPM-V-4_5 and OpenVINO
+# Chatbot with OpenVINO GenAI 2026
 
-This repository contains a minimal Python chatbot that uses the
-`openbmb/MiniCPM-V-4_5` causal language model and runs inference via
-[OpenVINO](https://www.openvino.ai/).
+This repository contains a minimal Python chatbot that uses
+`openvino-genai==2026.0.0` for inference.
 
-The project demonstrates how to export a Hugging Face transformer model to
-OpenVINO format using the `optimum` library and then execute a simple
-interactive prompt.
-
----
+On first run, the app can export a Hugging Face visual language model to
+OpenVINO format automatically, then run it through
+`openvino_genai.VLMPipeline`.
 
 ## Prerequisites
 
-- Python 3.8+ (tested on Windows)
-- A working internet connection to download model weights
+- Python 3.10+
+- A working internet connection for the first run
 
 Install dependencies:
 
@@ -21,34 +18,21 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
-> The first run will export the model from Transformers to OpenVINO.  The
-> converted files are cached under `~/.cache/ov_models`.
+`MiniCPM-V-4_5` uses remote model code that depends on Pillow and torchvision.
 
 ## Running the chatbot
 
 ```bash
-# default runs on CPU
 python chatbot/app.py
-
-# specify another OpenVINO device
-python chatbot/app.py --device GPU
+python chatbot/app.py --model-id openbmb/MiniCPM-V-4_5 --device GPU
+python chatbot/app.py --model-id openbmb/MiniCPM-V-4_5 --model-dir path/to/openvino_model
 ```
-Type a message and press Enter; the bot will reply.  Enter `exit` or
-`quit` to finish.
 
-## Project layout
-
-```
-.
-├── Readme.md        # this file
-├── requirements.txt # python dependencies
-└── chatbot
-    └── app.py       # main script
-```
+Type a message and press Enter. Enter `exit` or `quit` to finish.
 
 ## Notes
 
-- This is a minimal example; error handling and conversation context are
-  omitted for clarity.
-- You can customize generation parameters or add a web front‑end as needed.
-
+- The first run exports the model into `models/<model-id>/`.
+- The default model is `openbmb/MiniCPM-V-4_5`.
+- This app currently uses the model in text-chat mode, even though the
+  backend pipeline supports image inputs.

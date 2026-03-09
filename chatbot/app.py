@@ -1,94 +1,146 @@
 #!/usr/bin/env python3
-"""Simple chatbot using openbmb/MiniCPM-V-4_5 and OpenVINO.
+"""Simple chatbot using OpenVINO GenAI.
 
-This script loads the MiniCPM-V-4_5 causal language model from Hugging
-Face and exports it to OpenVINO format (if necessary) using Optimum. Once
-converted, the OpenVINO runtime is used for inference in a simple
-interactive loop.
+This script runs text generation with `openvino_genai.LLMPipeline`.
+If the target OpenVINO model directory does not exist yet, it is exported
+automatically from Hugging Face on first run.
 
 Usage:
     python chatbot/app.py
-
-Requirements:
-    - transformers
-    - optimum
-    - openvino-dev
-    - numpy
-
+    python chatbot/app.py --model-id some/model --device GPU
 """
-import os
-import sys
-from typing import Optional
+from pathlib import Path
 
-import numpy as np
-from transformers import AutoTokenizer
+import openvino as ov
+import openvino_genai as ov_genai
+from openvino_tokenizers import convert_tokenizer
+from transformers import AutoProcessor
 
 try:
-    from optimum.openvino import OVModelForCausalLM, OVTokenizer
-except ImportError:
+    from optimum.intel import OVModelForVisualCausalLM
+except ImportError as exc:
     raise RuntimeError(
-        "optimum-openvino is required. Install via `pip install optimum[openvino]` or `pip install openvino-dev`"
-    )
-
-MODEL_NAME = "openbmb/MiniCPM-V-4_5"  # Hugging Face model ID
+        "Automatic export requires optimum-intel. Install dependencies from requirements.txt."
+    ) from exc
 
 
-def load_or_export_model(model_name: str = MODEL_NAME, device: str = "CPU") -> OVModelForCausalLM:
-    """Load an OpenVINO model. If conversion is required, it will run
-    automatically and cache the results.
+MODEL_NAME = "openbmb/MiniCPM-V-4_5"
 
-    Args:
-        model_name: Hugging Face model identifier.
-        device: OpenVINO target device ("CPU", "GPU", "MYRIAD", etc.).
-    """
-    cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "ov_models")
-    os.makedirs(cache_dir, exist_ok=True)
 
-    model = OVModelForCausalLM.from_pretrained(
-        model_name,
-        from_transformers=True,
+def default_model_dir(model_id: str) -> Path:
+    return Path("models") / model_id.replace("/", "--")
+
+
+def export_model(model_id: str, model_dir: Path) -> None:
+    """Export a Hugging Face VLM into an OpenVINO GenAI-ready directory."""
+    model_dir.mkdir(parents=True, exist_ok=True)
+
+    processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+    model = OVModelForVisualCausalLM.from_pretrained(
+        model_id,
         export=True,
-        cache_dir=cache_dir,
+        trust_remote_code=True,
     )
-    model.to(device)
-    return model
+    model.save_pretrained(model_dir)
+    processor.save_pretrained(model_dir)
+
+    ov_tokenizer, ov_detokenizer = convert_tokenizer(processor.tokenizer, with_detokenizer=True)
+    ov.save_model(ov_tokenizer, model_dir / "openvino_tokenizer.xml")
+    ov.save_model(ov_detokenizer, model_dir / "openvino_detokenizer.xml")
 
 
-def chat_loop(model: OVModelForCausalLM, tokenizer: OVTokenizer) -> None:
-    """Interactive conversation loop."""
+def ensure_model_exported(model_id: str, model_dir: Path) -> Path:
+    """Export the model on first run if the target directory is missing artifacts."""
+    legacy_pairs = [
+        (model_dir / "tokenizer.xml", model_dir / "openvino_tokenizer.xml"),
+        (model_dir / "tokenizer.bin", model_dir / "openvino_tokenizer.bin"),
+        (model_dir / "detokenizer.xml", model_dir / "openvino_detokenizer.xml"),
+        (model_dir / "detokenizer.bin", model_dir / "openvino_detokenizer.bin"),
+    ]
+    for legacy_path, current_path in legacy_pairs:
+        if legacy_path.exists() and not current_path.exists():
+            legacy_path.replace(current_path)
+
+    required_files = [
+        model_dir / "openvino_model.xml",
+        model_dir / "openvino_model.bin",
+        model_dir / "openvino_tokenizer.xml",
+        model_dir / "openvino_detokenizer.xml",
+    ]
+    if all(path.exists() for path in required_files):
+        return model_dir
+
+    print(f"Exporting {model_id} to OpenVINO format at {model_dir} ...")
+    export_model(model_id, model_dir)
+    return model_dir
+
+
+def load_pipeline(model_dir: Path, device: str = "CPU") -> ov_genai.VLMPipeline:
+    """Load an OpenVINO GenAI VLM pipeline from an exported model directory."""
+    if not model_dir.exists():
+        raise FileNotFoundError(f"OpenVINO model directory not found: {model_dir}")
+
+    return ov_genai.VLMPipeline(str(model_dir), device)
+
+
+def build_generation_config() -> ov_genai.GenerationConfig:
+    """Return the default generation settings for interactive chat."""
+    config = ov_genai.GenerationConfig()
+    config.max_new_tokens = 128
+    config.do_sample = True
+    config.top_p = 0.95
+    config.temperature = 0.8
+    return config
+
+
+def chat_loop(pipeline: ov_genai.VLMPipeline) -> None:
+    """Interactive text-only conversation loop for a visual language model."""
+    generation_config = build_generation_config()
+    pipeline.start_chat()
+
     print("Type 'exit' or 'quit' to end.")
-    while True:
-        prompt = input("You: ")
-        if prompt.strip().lower() in {"exit", "quit"}:
-            break
-        # encode prompt
-        inputs = tokenizer(prompt, return_tensors="np")
-        out_tokens = model.generate(
-            **inputs,
-            max_new_tokens=128,
-            do_sample=True,
-            top_p=0.95,
-            temperature=0.8,
-        )
-        text = tokenizer.decode(out_tokens[0], skip_special_tokens=True)
-        print(f"Bot: {text}\n")
+    try:
+        while True:
+            prompt = input("You: ")
+            if prompt.strip().lower() in {"exit", "quit"}:
+                break
+
+            result = pipeline.generate(prompt, generation_config)
+            texts = result.texts if hasattr(result, "texts") else []
+            text = texts[0] if texts else str(result)
+            print(f"Bot: {text}\n")
+    finally:
+        pipeline.finish_chat()
 
 
-def main():
+def main() -> None:
     import argparse
 
-    parser = argparse.ArgumentParser(description="MiniCPM chat with OpenVINO")
+    parser = argparse.ArgumentParser(description="Chat with MiniCPM-V-4_5 via OpenVINO GenAI")
+    parser.add_argument(
+        "--model-id",
+        type=str,
+        default=MODEL_NAME,
+        help="Hugging Face model ID to export on first run",
+    )
+    parser.add_argument(
+        "--model-dir",
+        type=Path,
+        default=None,
+        help="Path to store or load the exported OpenVINO model directory",
+    )
     parser.add_argument(
         "--device",
         type=str,
         default="CPU",
-        help="OpenVINO device to use (CPU, GPU, MYRIAD, etc.)",
+        help="OpenVINO device to use (CPU, GPU, NPU, etc.)",
     )
     args = parser.parse_args()
 
-    tokenizer = OVTokenizer.from_pretrained(MODEL_NAME)
-    model = load_or_export_model(MODEL_NAME, device=args.device)
-    chat_loop(model, tokenizer)
+    model_dir = args.model_dir or default_model_dir(args.model_id)
+    ensure_model_exported(args.model_id, model_dir)
+    pipeline = load_pipeline(model_dir, device=args.device)
+    chat_loop(pipeline)
 
 
 if __name__ == "__main__":
